@@ -57,6 +57,10 @@ func (s *Storage) QueryRange(matchers []Matcher, startMs, endMs int64) ([]Series
 	// query always sees a consistent part set.
 	for _, p := range s.partitionsInRange(startMs, endMs) {
 		p.mu.RLock()
+		if p.dropped { // retention deleted the dir; expired data is legitimately gone
+			p.mu.RUnlock()
+			continue
+		}
 		for _, name := range p.parts {
 			dir := filepath.Join(p.dir, "parts", name)
 			blocks, err := readPart(dir, want, startMs, endMs, stats)

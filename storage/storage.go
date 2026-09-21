@@ -61,6 +61,11 @@ type Storage struct {
 	// flush. Set before StartFlushLoop. Default 3.
 	SmallPartsMergeThreshold int
 
+	// RetentionDays: partitions whose entire day is older than this are
+	// dropped by the retention loop. 0 (the default) keeps data forever.
+	// Set before StartRetentionLoop.
+	RetentionDays int
+
 	flushMu   sync.Mutex // serializes concurrent Flush calls
 	compactMu sync.Mutex // serializes all part merges
 	stopCh    chan struct{}
