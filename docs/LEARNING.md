@@ -25,7 +25,7 @@ formats (JSON manifests instead of binary metaindex, etc.).
 | Topic | VM path |
 |---|---|
 | Filenames / dirs | `lib/storage/filenames.go` |
-| TSID | `lib/storage/tsid.go` |
+| TSID (see [TSID.md](TSID.md)) | `lib/storage/tsid.go` |
 | AddRows | `lib/storage/storage.go` |
 | raw rows → inmemory | `lib/storage/raw_row.go`, `partition.go` |
 | inmemory part | `lib/storage/inmemory_part.go` |
