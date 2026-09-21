@@ -11,6 +11,22 @@ go run ./cmd/marchimetrics -storageDataPath=/tmp/mm-data
 # or: docker compose up --build
 ```
 
+### Prometheus remote_write
+
+Point a real Prometheus or vmagent at marchimetrics:
+
+```yaml
+remote_write:
+  - url: http://localhost:8428/api/v1/write
+```
+
+The endpoint speaks the standard protocol — a snappy-compressed
+`prompb.WriteRequest` — and returns `204` with an
+`X-Marchimetrics-Points-Ingested` header. Series without a metric name
+are skipped without failing the batch.
+
+### JSON import
+
 Ingest (JSON; timestamps in **milliseconds**; single object or array):
 
 ```bash
