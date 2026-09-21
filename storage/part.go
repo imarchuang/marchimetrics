@@ -47,9 +47,10 @@ type seriesIndexEntry struct {
 
 // writePart writes data as the contents of dir (already named
 // .publishing-* by the caller, who renames it into place afterwards).
+// tier is tierSmall for flushes, tierBig for compaction output.
 // Samples are stored raw little-endian — VM does delta/varint encoding
 // and compression here, which the MVP deliberately skips (LEARNING.md).
-func writePart(dir string, data map[uint64][]Sample) (*partMeta, error) {
+func writePart(dir string, data map[uint64][]Sample, tier string) (*partMeta, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -62,7 +63,7 @@ func writePart(dir string, data map[uint64][]Sample) (*partMeta, error) {
 
 	var tsBuf, valBuf bytes.Buffer
 	index := make(map[string]seriesIndexEntry, len(ids))
-	meta := &partMeta{MinTime: math.MaxInt64, MaxTime: math.MinInt64, Tier: tierSmall}
+	meta := &partMeta{MinTime: math.MaxInt64, MaxTime: math.MinInt64, Tier: tier}
 	var b [8]byte
 	var offset uint64
 	for _, id := range ids {
@@ -107,18 +108,28 @@ func writePart(dir string, data map[uint64][]Sample) (*partMeta, error) {
 	return meta, nil
 }
 
+// readPartMeta reads just meta.json — used for time-range pruning and
+// by compaction to find small parts.
+func readPartMeta(dir string) (*partMeta, error) {
+	data, err := os.ReadFile(filepath.Join(dir, partMetaFile))
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s: %w", partMetaFile, err)
+	}
+	var meta partMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, fmt.Errorf("cannot parse %s: %w", partMetaFile, err)
+	}
+	return &meta, nil
+}
+
 // readPart returns samples for the wanted series within [startMs, endMs],
 // accumulating IO cost into st. A part whose time range does not overlap
 // is skipped without touching st — skipping via meta.json is exactly the
 // cheap read the stats are meant to make visible.
 func readPart(dir string, want map[uint64]struct{}, startMs, endMs int64, st *QueryStats) (map[uint64][]Sample, error) {
-	metaData, err := os.ReadFile(filepath.Join(dir, partMetaFile))
+	meta, err := readPartMeta(dir)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read %s: %w", partMetaFile, err)
-	}
-	var meta partMeta
-	if err := json.Unmarshal(metaData, &meta); err != nil {
-		return nil, fmt.Errorf("cannot parse %s: %w", partMetaFile, err)
+		return nil, err
 	}
 	if meta.MaxTime < startMs || meta.MinTime > endMs {
 		return nil, nil
@@ -172,6 +183,54 @@ func readPart(dir string, want map[uint64]struct{}, startMs, endMs int64, st *Qu
 			v := math.Float64frombits(binary.LittleEndian.Uint64(valBuf[i*8:]))
 			out[id] = append(out[id], Sample{Timestamp: t, Value: v})
 		}
+	}
+	return out, nil
+}
+
+// readPartAll reads every series block in the part without any time
+// filtering — compaction by definition needs all the data.
+func readPartAll(dir string) (map[uint64][]Sample, error) {
+	idxData, err := os.ReadFile(filepath.Join(dir, partSeriesIndex))
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s: %w", partSeriesIndex, err)
+	}
+	var index map[string]seriesIndexEntry
+	if err := json.Unmarshal(idxData, &index); err != nil {
+		return nil, fmt.Errorf("cannot parse %s: %w", partSeriesIndex, err)
+	}
+
+	tsFile, err := os.Open(filepath.Join(dir, partTimestampsBin))
+	if err != nil {
+		return nil, err
+	}
+	defer tsFile.Close()
+	valFile, err := os.Open(filepath.Join(dir, partValuesBin))
+	if err != nil {
+		return nil, err
+	}
+	defer valFile.Close()
+
+	out := make(map[uint64][]Sample, len(index))
+	for idStr, e := range index {
+		id, err := strconv.ParseUint(idStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("bad series id %q in %s: %w", idStr, partSeriesIndex, err)
+		}
+		tsBuf := make([]byte, e.Count*8)
+		if _, err := tsFile.ReadAt(tsBuf, int64(e.Offset*8)); err != nil {
+			return nil, fmt.Errorf("cannot read timestamps for series %d: %w", id, err)
+		}
+		valBuf := make([]byte, e.Count*8)
+		if _, err := valFile.ReadAt(valBuf, int64(e.Offset*8)); err != nil {
+			return nil, fmt.Errorf("cannot read values for series %d: %w", id, err)
+		}
+		samples := make([]Sample, 0, e.Count)
+		for i := uint64(0); i < e.Count; i++ {
+			t := int64(binary.LittleEndian.Uint64(tsBuf[i*8:]))
+			v := math.Float64frombits(binary.LittleEndian.Uint64(valBuf[i*8:]))
+			samples = append(samples, Sample{Timestamp: t, Value: v})
+		}
+		out[id] = samples
 	}
 	return out, nil
 }

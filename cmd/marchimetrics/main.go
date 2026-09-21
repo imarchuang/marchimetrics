@@ -23,6 +23,8 @@ var (
 	flushInterval = flag.Duration("inmemoryDataFlushInterval", 5*time.Second,
 		"How often in-memory samples are flushed to disk parts. "+
 			"A crash can lose at most this much data (durability window)")
+	mergeThreshold = flag.Int("smallPartsMergeThreshold", 3,
+		"A day partition with at least this many small parts merges them into one big part after a flush")
 )
 
 func main() {
@@ -33,6 +35,7 @@ func main() {
 		log.Fatalf("cannot open storage at %q: %s", *storageDataPath, err)
 	}
 	log.Printf("storage opened at %q (flush interval %s)", store.Path(), *flushInterval)
+	store.SmallPartsMergeThreshold = *mergeThreshold
 	store.StartFlushLoop(*flushInterval)
 
 	srv := newServer(store)

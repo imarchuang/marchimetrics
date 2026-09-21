@@ -56,7 +56,13 @@ type Storage struct {
 	pmu        sync.Mutex
 	partitions map[string]*partition
 
+	// SmallPartsMergeThreshold is the number of small parts in one
+	// partition that triggers a merge into a tier:big part after a
+	// flush. Set before StartFlushLoop. Default 3.
+	SmallPartsMergeThreshold int
+
 	flushMu   sync.Mutex // serializes concurrent Flush calls
+	compactMu sync.Mutex // serializes all part merges
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -72,11 +78,12 @@ func Open(path string) (*Storage, error) {
 		}
 	}
 	s := &Storage{
-		path:       path,
-		registry:   NewRegistry(),
-		mem:        make(map[uint64][]Sample),
-		partitions: make(map[string]*partition),
-		stopCh:     make(chan struct{}),
+		path:                     path,
+		registry:                 NewRegistry(),
+		mem:                      make(map[uint64][]Sample),
+		partitions:               make(map[string]*partition),
+		SmallPartsMergeThreshold: 3,
+		stopCh:                   make(chan struct{}),
 	}
 	if err := s.loadRegistry(); err != nil {
 		return nil, err
@@ -169,6 +176,11 @@ func (s *Storage) Flush() error {
 		if err := p.addPart(data); err != nil {
 			s.restoreMem(data)
 			return fmt.Errorf("cannot flush partition %s: %w", day, err)
+		}
+		// The flush succeeded and the data is durable; a failed merge is
+		// not a flush failure, so it is only logged.
+		if err := s.maybeCompact(p); err != nil {
+			log.Printf("cannot compact partition %s after flush: %s", day, err)
 		}
 	}
 	return nil

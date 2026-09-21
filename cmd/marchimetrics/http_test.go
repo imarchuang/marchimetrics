@@ -41,6 +41,41 @@ func TestQueryRangeStatsHeaders(t *testing.T) {
 	}
 }
 
+// PR4: POST /internal/force_merge compacts small parts on demand.
+func TestForceMergeEndpoint(t *testing.T) {
+	store, _ := storage.Open(t.TempDir())
+	labels := []storage.Label{{Name: storage.MetricNameLabel, Value: "m"}}
+	store.Append(labels, []storage.Sample{{Timestamp: 1000, Value: 1}})
+	if err := store.Flush(); err != nil {
+		t.Fatalf("Flush: %s", err)
+	}
+	store.Append(labels, []storage.Sample{{Timestamp: 2000, Value: 2}})
+	if err := store.Flush(); err != nil {
+		t.Fatalf("Flush: %s", err)
+	}
+
+	srv := newServer(store)
+	rec := httptest.NewRecorder()
+	srv.routes().ServeHTTP(rec, httptest.NewRequest("POST", "/internal/force_merge", nil))
+	if rec.Code != 204 {
+		t.Fatalf("force_merge status = %d, body %s", rec.Code, rec.Body)
+	}
+
+	// Data survives the merge: both points queryable.
+	req := httptest.NewRequest("GET", "/api/v1/query_range?query=m&start=0&end=10", nil)
+	rec = httptest.NewRecorder()
+	srv.routes().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("query status = %d", rec.Code)
+	}
+	if got := rec.Header().Get("X-Marchimetrics-Points-Returned"); got != "2" {
+		t.Fatalf("Points-Returned = %s, want 2 after merge", got)
+	}
+	if got := rec.Header().Get("X-Marchimetrics-Parts-Scanned"); got != "1" {
+		t.Fatalf("Parts-Scanned = %s, want 1 (merged big part)", got)
+	}
+}
+
 func TestQueryRangeBadRequests(t *testing.T) {
 	store, _ := storage.Open(t.TempDir())
 	srv := newServer(store)

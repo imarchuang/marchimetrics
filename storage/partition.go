@@ -20,7 +20,11 @@ type partition struct {
 	day string
 	dir string
 
-	mu     sync.Mutex
+	// mu guards parts/nextID. Queries hold the read lock for the whole
+	// scan of this partition, so compaction (which needs the write lock
+	// to swap the manifest and delete merged dirs) can never delete a
+	// part out from under an in-flight query.
+	mu     sync.RWMutex
 	parts  []string // live part names; mirrors manifest.json
 	nextID int
 }
@@ -72,7 +76,7 @@ func (p *partition) addPart(data map[uint64][]Sample) error {
 	name := fmt.Sprintf("%06d", id)
 	staging := filepath.Join(p.dir, "parts", publishingPrefix+name)
 	final := filepath.Join(p.dir, "parts", name)
-	if _, err := writePart(staging, data); err != nil {
+	if _, err := writePart(staging, data, tierSmall); err != nil {
 		os.RemoveAll(staging)
 		return err
 	}
@@ -93,7 +97,7 @@ func (p *partition) addPart(data map[uint64][]Sample) error {
 
 // partsSnapshot returns the currently live part names.
 func (p *partition) partsSnapshot() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return append([]string(nil), p.parts...)
 }

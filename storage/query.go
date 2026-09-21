@@ -51,18 +51,24 @@ func (s *Storage) QueryRange(matchers []Matcher, startMs, endMs int64) ([]Series
 
 	merged := make(map[uint64][]Sample, len(ids))
 
-	// Disk tier: immutable parts of overlapping day partitions.
+	// Disk tier: immutable parts of overlapping day partitions. The
+	// partition read lock is held for the whole scan so that compaction
+	// cannot swap the manifest and delete merged parts mid-query — a
+	// query always sees a consistent part set.
 	for _, p := range s.partitionsInRange(startMs, endMs) {
-		for _, name := range p.partsSnapshot() {
+		p.mu.RLock()
+		for _, name := range p.parts {
 			dir := filepath.Join(p.dir, "parts", name)
 			blocks, err := readPart(dir, want, startMs, endMs, stats)
 			if err != nil {
+				p.mu.RUnlock()
 				return nil, stats, fmt.Errorf("cannot read part %s/parts/%s: %w", p.day, name, err)
 			}
 			for id, samples := range blocks {
 				merged[id] = append(merged[id], samples...)
 			}
 		}
+		p.mu.RUnlock()
 	}
 
 	// Memory tier: the not-yet-flushed buffer.
