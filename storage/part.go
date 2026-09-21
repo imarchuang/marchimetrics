@@ -107,9 +107,11 @@ func writePart(dir string, data map[uint64][]Sample) (*partMeta, error) {
 	return meta, nil
 }
 
-// readPart returns samples for the wanted series within [startMs, endMs].
-// It returns (nil, nil) when the part's time range does not overlap.
-func readPart(dir string, want map[uint64]struct{}, startMs, endMs int64) (map[uint64][]Sample, error) {
+// readPart returns samples for the wanted series within [startMs, endMs],
+// accumulating IO cost into st. A part whose time range does not overlap
+// is skipped without touching st — skipping via meta.json is exactly the
+// cheap read the stats are meant to make visible.
+func readPart(dir string, want map[uint64]struct{}, startMs, endMs int64, st *QueryStats) (map[uint64][]Sample, error) {
 	metaData, err := os.ReadFile(filepath.Join(dir, partMetaFile))
 	if err != nil {
 		return nil, fmt.Errorf("cannot read %s: %w", partMetaFile, err)
@@ -121,6 +123,7 @@ func readPart(dir string, want map[uint64]struct{}, startMs, endMs int64) (map[u
 	if meta.MaxTime < startMs || meta.MinTime > endMs {
 		return nil, nil
 	}
+	st.PartsScanned++
 
 	idxData, err := os.ReadFile(filepath.Join(dir, partSeriesIndex))
 	if err != nil {
@@ -151,6 +154,8 @@ func readPart(dir string, want map[uint64]struct{}, startMs, endMs int64) (map[u
 		if _, ok := want[id]; !ok {
 			continue
 		}
+		st.BlocksScanned++
+		st.PointsScanned += int(e.Count)
 		tsBuf := make([]byte, e.Count*8)
 		if _, err := tsFile.ReadAt(tsBuf, int64(e.Offset*8)); err != nil {
 			return nil, fmt.Errorf("cannot read timestamps for series %d: %w", id, err)

@@ -27,6 +27,16 @@ Query (selector subset only; `start`/`end` as unix seconds or RFC3339):
 curl -s 'http://localhost:8428/api/v1/query_range?query=http_requests_total{job="api"}&start=1789954300&end=1789954600'
 ```
 
+Every query reports its disk cost in response headers (disk tier only;
+the in-memory buffer is cheap by design):
+
+```
+X-Marchimetrics-Parts-Scanned    # parts opened (meta.json time range overlapped)
+X-Marchimetrics-Blocks-Scanned   # series blocks decoded from those parts
+X-Marchimetrics-Points-Scanned   # samples decoded, before time filtering
+X-Marchimetrics-Points-Returned  # samples in the final merged result
+```
+
 Imported data is queryable immediately from the in-memory buffer, and is
 flushed to immutable day-partition parts every `-inmemoryDataFlushInterval`
 (default 5s) or on demand:

@@ -13,7 +13,7 @@ func testLabels(metric, job string) []Label {
 
 func mustQuery(t *testing.T, s *Storage, matchers []Matcher, start, end int64) []SeriesResult {
 	t.Helper()
-	got, err := s.QueryRange(matchers, start, end)
+	got, _, err := s.QueryRange(matchers, start, end)
 	if err != nil {
 		t.Fatalf("QueryRange: %s", err)
 	}
@@ -91,7 +91,7 @@ func TestConcurrentAppendAndQuery(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < 100; i++ {
-			if _, err := s.QueryRange([]Matcher{{Name: MetricNameLabel, Value: "m"}}, 0, 1000); err != nil {
+			if _, _, err := s.QueryRange([]Matcher{{Name: MetricNameLabel, Value: "m"}}, 0, 1000); err != nil {
 				t.Errorf("QueryRange: %s", err)
 			}
 		}
@@ -204,6 +204,46 @@ func TestQueryMergesMemAndDisk(t *testing.T) {
 	}
 }
 
+// PR3: query stats reflect the disk tier — parts/blocks/points scanned
+// vs. points returned after merging with the mem buffer.
+func TestQueryStatsTiers(t *testing.T) {
+	s, _ := Open(t.TempDir())
+	s.Append(testLabels("m", "api"), []Sample{{Timestamp: 1000, Value: 1}, {Timestamp: 2000, Value: 2}})
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush: %s", err)
+	}
+	s.Append(testLabels("m", "api"), []Sample{{Timestamp: 3000, Value: 3}}) // stays in mem
+
+	_, stats, err := s.QueryRange([]Matcher{{Name: MetricNameLabel, Value: "m"}}, 0, 10_000)
+	if err != nil {
+		t.Fatalf("QueryRange: %s", err)
+	}
+	want := QueryStats{PartsScanned: 1, BlocksScanned: 1, PointsScanned: 2, PointsReturned: 3}
+	if *stats != want {
+		t.Fatalf("stats = %+v, want %+v", *stats, want)
+	}
+}
+
+// PR3: a query window that misses every part scans nothing on disk but
+// still returns mem-tier points.
+func TestQueryStatsSkipNonOverlappingParts(t *testing.T) {
+	s, _ := Open(t.TempDir())
+	s.Append(testLabels("m", "api"), []Sample{{Timestamp: 1000, Value: 1}})
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush: %s", err)
+	}
+	s.Append(testLabels("m", "api"), []Sample{{Timestamp: 500_000, Value: 5}})
+
+	_, stats, err := s.QueryRange([]Matcher{{Name: MetricNameLabel, Value: "m"}}, 400_000, 600_000)
+	if err != nil {
+		t.Fatalf("QueryRange: %s", err)
+	}
+	want := QueryStats{PartsScanned: 0, BlocksScanned: 0, PointsScanned: 0, PointsReturned: 1}
+	if *stats != want {
+		t.Fatalf("stats = %+v, want %+v", *stats, want)
+	}
+}
+
 // PR2: concurrent flushes and appends/queries must not race or lose data.
 func TestConcurrentFlushAppendQuery(t *testing.T) {
 	s, _ := Open(t.TempDir())
@@ -224,7 +264,7 @@ func TestConcurrentFlushAppendQuery(t *testing.T) {
 	go func() {
 		defer workers.Done()
 		for i := 0; i < 50; i++ {
-			if _, err := s.QueryRange([]Matcher{{Name: MetricNameLabel, Value: "m"}}, 0, 1_000_000); err != nil {
+			if _, _, err := s.QueryRange([]Matcher{{Name: MetricNameLabel, Value: "m"}}, 0, 1_000_000); err != nil {
 				t.Errorf("QueryRange: %s", err)
 			}
 		}
