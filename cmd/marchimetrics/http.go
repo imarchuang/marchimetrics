@@ -24,6 +24,7 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/api/v1/import", s.handleImport)
 	mux.HandleFunc("/api/v1/query_range", s.handleQueryRange)
+	mux.HandleFunc("/internal/force_flush", s.handleForceFlush)
 	return mux
 }
 
@@ -132,11 +133,17 @@ func (s *server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	results, err := s.store.QueryRange(matchers, start, end)
+	if err != nil {
+		http.Error(w, "query failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	var resp queryResult
 	resp.Status = "success"
 	resp.Data.ResultType = "matrix"
 	resp.Data.Result = []matrixEntry{}
-	for _, sr := range s.store.QueryRange(matchers, start, end) {
+	for _, sr := range results {
 		entry := matrixEntry{Metric: make(map[string]string, len(sr.Labels))}
 		for _, l := range sr.Labels {
 			entry.Metric[l.Name] = l.Value
@@ -150,6 +157,20 @@ func (s *server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// handleForceFlush triggers an immediate flush of the in-memory buffer
+// to disk parts (same name as VictoriaMetrics' endpoint).
+func (s *server) handleForceFlush(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.store.Flush(); err != nil {
+		http.Error(w, "flush failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // parseTimeParam accepts RFC3339 or Unix seconds (Prometheus convention)

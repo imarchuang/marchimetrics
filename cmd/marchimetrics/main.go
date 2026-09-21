@@ -33,6 +33,7 @@ func main() {
 		log.Fatalf("cannot open storage at %q: %s", *storageDataPath, err)
 	}
 	log.Printf("storage opened at %q (flush interval %s)", store.Path(), *flushInterval)
+	store.StartFlushLoop(*flushInterval)
 
 	srv := newServer(store)
 	go func() {
