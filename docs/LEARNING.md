@@ -82,6 +82,20 @@ design. Two consequences worth remembering:
 - A part skipped via its `meta.json` time range does not count as
   scanned, so an all-zero stats line proves that pruning worked.
 
+### Compaction: merge under the partition write lock
+
+When a partition accumulates `SmallPartsMergeThreshold` small parts
+(default 3, checked after each flush; `POST /internal/force_merge`
+bypasses the threshold), they merge into one `tier: big` part: read all
+blocks, concat per series, time-sort, write a new part, then swap the
+manifest and delete the old dirs. The swap phase runs under the
+partition's write lock while queries scan under the read lock, so a query
+always sees a consistent part set — never a mix of old and new, never a
+deleted file. VM instead refcounts parts and deletes asynchronously (see
+`lib/storage/partition.go`) — worth revisiting if this lock ever shows up
+as a bottleneck. Duplicate (series, timestamp) pairs are kept as-is
+(dedup is a non-goal), and big parts are not re-merged in the MVP.
+
 ## Non-goals (deliberately omitted)
 
 - Cluster split (`vminsert` / `vmselect` / `vmstorage`), HA, replication
