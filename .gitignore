@@ -1,0 +1,9 @@
+# Local data directory (default -storageDataPath)
+/marchimetrics-data/
+
+# Local build artifacts
+/marchimetrics
+/bin/
+
+# macOS
+.DS_Store

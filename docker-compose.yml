@@ -1,0 +1,13 @@
+services:
+  marchimetrics:
+    build: .
+    ports:
+      - "8428:8428"
+    volumes:
+      - marchimetrics-data:/data
+    command:
+      - "-storageDataPath=/data"
+      - "-inmemoryDataFlushInterval=5s"
+
+volumes:
+  marchimetrics-data: {}
