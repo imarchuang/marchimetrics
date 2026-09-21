@@ -8,8 +8,8 @@ import (
 
 // Label is a single Prometheus-style name/value pair.
 type Label struct {
-	Name  string
-	Value string
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // MetricNameLabel is the reserved label that holds the metric name —
@@ -128,6 +128,48 @@ func (r *Registry) Len() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.names)
+}
+
+// Snapshot returns a copy of the forward mapping (SeriesID -> sorted
+// label set) for persistence as series/names.json.
+func (r *Registry) Snapshot() map[uint64][]Label {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[uint64][]Label, len(r.names))
+	for id, labels := range r.names {
+		out[id] = labels
+	}
+	return out
+}
+
+// Load restores a snapshot taken by Snapshot, rebuilding the canonical
+// and inverted indexes and continuing IDs past the maximum seen. The
+// inverted index is deliberately not persisted: names.json is the single
+// source of truth and the index is derived from it at load time.
+func (r *Registry) Load(names map[uint64][]Label) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var maxID uint64
+	for id, labels := range names {
+		sorted := sortedLabels(labels)
+		r.names[id] = sorted
+		r.byKey[CanonicalKey(sorted)] = id
+		for _, l := range sorted {
+			k := labelKey(l.Name, l.Value)
+			set := r.inverted[k]
+			if set == nil {
+				set = make(map[uint64]struct{})
+				r.inverted[k] = set
+			}
+			set[id] = struct{}{}
+		}
+		if id > maxID {
+			maxID = id
+		}
+	}
+	if maxID >= r.nextID {
+		r.nextID = maxID + 1
+	}
 }
 
 // Match returns the sorted SeriesIDs whose label sets satisfy every

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -22,37 +23,58 @@ type SeriesResult struct {
 }
 
 // QueryRange returns raw samples for all series matching every matcher,
-// keeping timestamps in [startMs, endMs]. It scans the in-memory buffer,
-// so freshly appended data is queryable before any flush; scanning
-// flushed disk parts arrives with PR2/PR3.
-func (s *Storage) QueryRange(matchers []Matcher, startMs, endMs int64) []SeriesResult {
+// keeping timestamps in [startMs, endMs]. It merges two source tiers:
+// the in-memory buffer (data appended since the last flush) and the
+// immutable disk parts of every overlapping day partition — so data is
+// queryable both before and after a flush.
+func (s *Storage) QueryRange(matchers []Matcher, startMs, endMs int64) ([]SeriesResult, error) {
 	ids := s.registry.Match(matchers)
-	results := make([]SeriesResult, 0, len(ids))
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	want := make(map[uint64]struct{}, len(ids))
 	for _, id := range ids {
-		samples := samplesInRange(s.mem[id], startMs, endMs)
+		want[id] = struct{}{}
+	}
+
+	merged := make(map[uint64][]Sample, len(ids))
+
+	// Disk tier: immutable parts of overlapping day partitions.
+	for _, p := range s.partitionsInRange(startMs, endMs) {
+		for _, name := range p.partsSnapshot() {
+			dir := filepath.Join(p.dir, "parts", name)
+			blocks, err := readPart(dir, want, startMs, endMs)
+			if err != nil {
+				return nil, fmt.Errorf("cannot read part %s/parts/%s: %w", p.day, name, err)
+			}
+			for id, samples := range blocks {
+				merged[id] = append(merged[id], samples...)
+			}
+		}
+	}
+
+	// Memory tier: the not-yet-flushed buffer.
+	s.mu.RLock()
+	for _, id := range ids {
+		for _, sm := range s.mem[id] {
+			if sm.Timestamp >= startMs && sm.Timestamp <= endMs {
+				merged[id] = append(merged[id], sm)
+			}
+		}
+	}
+	s.mu.RUnlock()
+
+	results := make([]SeriesResult, 0, len(merged))
+	for _, id := range ids {
+		samples := merged[id]
 		if len(samples) == 0 {
 			continue
 		}
+		sort.Slice(samples, func(i, j int) bool { return samples[i].Timestamp < samples[j].Timestamp })
 		labels, _ := s.registry.Labels(id)
 		results = append(results, SeriesResult{ID: id, Labels: labels, Samples: samples})
 	}
-	return results
-}
-
-// samplesInRange filters and time-sorts samples. Disk parts will store
-// pre-sorted blocks (PR2); the mem buffer sorts at query time.
-func samplesInRange(samples []Sample, startMs, endMs int64) []Sample {
-	out := make([]Sample, 0, len(samples))
-	for _, s := range samples {
-		if s.Timestamp >= startMs && s.Timestamp <= endMs {
-			out = append(out, s)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp < out[j].Timestamp })
-	return out
+	return results, nil
 }
 
 var metricNameRE = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)

@@ -77,3 +77,25 @@ func TestRegistryMatchIntersects(t *testing.T) {
 		t.Fatalf("match = %v, want empty", ids)
 	}
 }
+
+func TestRegistrySnapshotLoadRoundTrip(t *testing.T) {
+	r := NewRegistry()
+	id1 := r.Resolve([]Label{{Name: MetricNameLabel, Value: "m"}, {Name: "job", Value: "api"}})
+	id2 := r.Resolve([]Label{{Name: MetricNameLabel, Value: "m"}, {Name: "job", Value: "web"}})
+
+	r2 := NewRegistry()
+	r2.Load(r.Snapshot())
+
+	// Same label sets resolve to the same IDs after reload.
+	if got := r2.Resolve([]Label{{Name: "job", Value: "api"}, {Name: MetricNameLabel, Value: "m"}}); got != id1 {
+		t.Fatalf("reloaded registry resolved %d, want %d", got, id1)
+	}
+	// The inverted index is rebuilt from names alone.
+	if ids := r2.Match([]Matcher{{Name: "job", Value: "web"}}); len(ids) != 1 || ids[0] != id2 {
+		t.Fatalf("match after reload = %v, want [%d]", ids, id2)
+	}
+	// New IDs continue past the reloaded maximum.
+	if id3 := r2.Resolve([]Label{{Name: MetricNameLabel, Value: "new"}}); id3 <= id2 {
+		t.Fatalf("new ID %d after reload, want > %d", id3, id2)
+	}
+}

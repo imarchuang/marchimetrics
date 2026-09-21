@@ -27,7 +27,16 @@ Query (selector subset only; `start`/`end` as unix seconds or RFC3339):
 curl -s 'http://localhost:8428/api/v1/query_range?query=http_requests_total{job="api"}&start=1789954300&end=1789954600'
 ```
 
-Imported data is queryable immediately — flush to immutable disk parts
-arrives in PR2. Design notes: [docs/TSID.md](docs/TSID.md).
+Imported data is queryable immediately from the in-memory buffer, and is
+flushed to immutable day-partition parts every `-inmemoryDataFlushInterval`
+(default 5s) or on demand:
+
+```bash
+curl -XPOST localhost:8428/internal/force_flush
+# inspect: /tmp/mm-data/partitions/YYYYMMDD/{manifest.json,parts/000001/...}
+```
+
+A crash loses at most one flush interval of samples; everything flushed
+survives `kill -9`. Design notes: [docs/TSID.md](docs/TSID.md).
 
 See [PLAN.md](PLAN.md) for the full MVP plan, VictoriaMetrics source study list, and implementation slices.
