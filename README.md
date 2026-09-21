@@ -46,6 +46,14 @@ curl -XPOST localhost:8428/internal/force_flush
 # inspect: /tmp/mm-data/partitions/YYYYMMDD/{manifest.json,parts/000001/...}
 ```
 
+Compaction: once a day partition accumulates `-smallPartsMergeThreshold`
+(default 3) small parts, they merge into one `tier: big` part
+automatically after a flush — or on demand:
+
+```bash
+curl -XPOST localhost:8428/internal/force_merge
+```
+
 A crash loses at most one flush interval of samples; everything flushed
 survives `kill -9`. Design notes: [docs/TSID.md](docs/TSID.md).
 

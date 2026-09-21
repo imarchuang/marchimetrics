@@ -12,7 +12,7 @@ func TestWriteReadPartRoundTrip(t *testing.T) {
 		1: {{Timestamp: 3000, Value: 3}, {Timestamp: 1000, Value: 1}}, // unsorted on purpose
 		2: {{Timestamp: 2000, Value: 2.5}},
 	}
-	meta, err := writePart(dir, data)
+	meta, err := writePart(dir, data, tierSmall)
 	if err != nil {
 		t.Fatalf("writePart: %s", err)
 	}
@@ -51,7 +51,7 @@ func TestReadPartFiltersByTimeAndSeries(t *testing.T) {
 		1: {{Timestamp: 1000, Value: 1}, {Timestamp: 5000, Value: 5}},
 		2: {{Timestamp: 2000, Value: 2}},
 	}
-	if _, err := writePart(dir, data); err != nil {
+	if _, err := writePart(dir, data, tierSmall); err != nil {
 		t.Fatalf("writePart: %s", err)
 	}
 
@@ -99,7 +99,7 @@ func TestReadPartFiltersByTimeAndSeries(t *testing.T) {
 
 func TestReadPartSkipsMissingOverlap(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := writePart(dir, map[uint64][]Sample{1: {{Timestamp: 1000, Value: 1}}}); err != nil {
+	if _, err := writePart(dir, map[uint64][]Sample{1: {{Timestamp: 1000, Value: 1}}}, tierSmall); err != nil {
 		t.Fatalf("writePart: %s", err)
 	}
 	got, err := readPart(dir, map[uint64]struct{}{1: {}}, 2000, 3000, &QueryStats{})
@@ -113,7 +113,7 @@ func TestReadPartSkipsMissingOverlap(t *testing.T) {
 
 func TestPartFilesExist(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := writePart(dir, map[uint64][]Sample{1: {{Timestamp: 1000, Value: 1}}}); err != nil {
+	if _, err := writePart(dir, map[uint64][]Sample{1: {{Timestamp: 1000, Value: 1}}}, tierSmall); err != nil {
 		t.Fatalf("writePart: %s", err)
 	}
 	for _, name := range []string{partMetaFile, partSeriesIndex, partTimestampsBin, partValuesBin} {

@@ -25,6 +25,7 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("/api/v1/import", s.handleImport)
 	mux.HandleFunc("/api/v1/query_range", s.handleQueryRange)
 	mux.HandleFunc("/internal/force_flush", s.handleForceFlush)
+	mux.HandleFunc("/internal/force_merge", s.handleForceMerge)
 	return mux
 }
 
@@ -174,6 +175,20 @@ func (s *server) handleForceFlush(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.store.Flush(); err != nil {
 		http.Error(w, "flush failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleForceMerge compacts every partition that has at least two small
+// parts into a tier:big part (same name as VictoriaMetrics' endpoint).
+func (s *server) handleForceMerge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.store.ForceMerge(); err != nil {
+		http.Error(w, "merge failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
