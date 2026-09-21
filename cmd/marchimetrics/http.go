@@ -23,6 +23,7 @@ func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/api/v1/import", s.handleImport)
+	mux.HandleFunc("/api/v1/write", s.handleRemoteWrite)
 	mux.HandleFunc("/api/v1/query_range", s.handleQueryRange)
 	mux.HandleFunc("/internal/force_flush", s.handleForceFlush)
 	mux.HandleFunc("/internal/force_merge", s.handleForceMerge)
