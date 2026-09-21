@@ -133,11 +133,17 @@ func (s *server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := s.store.QueryRange(matchers, start, end)
+	results, stats, err := s.store.QueryRange(matchers, start, end)
 	if err != nil {
 		http.Error(w, "query failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Query cost visibility (PLAN.md pass bar: parts/blocks/points scanned).
+	w.Header().Set("X-Marchimetrics-Parts-Scanned", strconv.Itoa(stats.PartsScanned))
+	w.Header().Set("X-Marchimetrics-Blocks-Scanned", strconv.Itoa(stats.BlocksScanned))
+	w.Header().Set("X-Marchimetrics-Points-Scanned", strconv.Itoa(stats.PointsScanned))
+	w.Header().Set("X-Marchimetrics-Points-Returned", strconv.Itoa(stats.PointsReturned))
 
 	var resp queryResult
 	resp.Status = "success"

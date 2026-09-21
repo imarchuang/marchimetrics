@@ -22,15 +22,27 @@ type SeriesResult struct {
 	Samples []Sample
 }
 
+// QueryStats reports what a query touched (PLAN.md pass bar: "query
+// stats show parts/blocks/points scanned"). Only the disk tier is
+// counted as "scanned" — the stats exist to make disk IO cost visible;
+// scanning the in-memory buffer is cheap by comparison.
+type QueryStats struct {
+	PartsScanned   int // disk parts opened and read (time range overlapped)
+	BlocksScanned  int // series blocks decoded from those parts
+	PointsScanned  int // samples decoded from disk blocks, before time filtering
+	PointsReturned int // samples in the final merged result (disk + mem)
+}
+
 // QueryRange returns raw samples for all series matching every matcher,
 // keeping timestamps in [startMs, endMs]. It merges two source tiers:
 // the in-memory buffer (data appended since the last flush) and the
 // immutable disk parts of every overlapping day partition — so data is
 // queryable both before and after a flush.
-func (s *Storage) QueryRange(matchers []Matcher, startMs, endMs int64) ([]SeriesResult, error) {
+func (s *Storage) QueryRange(matchers []Matcher, startMs, endMs int64) ([]SeriesResult, *QueryStats, error) {
+	stats := &QueryStats{}
 	ids := s.registry.Match(matchers)
 	if len(ids) == 0 {
-		return nil, nil
+		return nil, stats, nil
 	}
 	want := make(map[uint64]struct{}, len(ids))
 	for _, id := range ids {
@@ -43,9 +55,9 @@ func (s *Storage) QueryRange(matchers []Matcher, startMs, endMs int64) ([]Series
 	for _, p := range s.partitionsInRange(startMs, endMs) {
 		for _, name := range p.partsSnapshot() {
 			dir := filepath.Join(p.dir, "parts", name)
-			blocks, err := readPart(dir, want, startMs, endMs)
+			blocks, err := readPart(dir, want, startMs, endMs, stats)
 			if err != nil {
-				return nil, fmt.Errorf("cannot read part %s/parts/%s: %w", p.day, name, err)
+				return nil, stats, fmt.Errorf("cannot read part %s/parts/%s: %w", p.day, name, err)
 			}
 			for id, samples := range blocks {
 				merged[id] = append(merged[id], samples...)
@@ -72,9 +84,10 @@ func (s *Storage) QueryRange(matchers []Matcher, startMs, endMs int64) ([]Series
 		}
 		sort.Slice(samples, func(i, j int) bool { return samples[i].Timestamp < samples[j].Timestamp })
 		labels, _ := s.registry.Labels(id)
+		stats.PointsReturned += len(samples)
 		results = append(results, SeriesResult{ID: id, Labels: labels, Samples: samples})
 	}
-	return results, nil
+	return results, stats, nil
 }
 
 var metricNameRE = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
