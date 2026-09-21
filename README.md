@@ -57,4 +57,17 @@ curl -XPOST localhost:8428/internal/force_merge
 A crash loses at most one flush interval of samples; everything flushed
 survives `kill -9`. Design notes: [docs/TSID.md](docs/TSID.md).
 
+## Durability & retention
+
+- Imported samples are queryable immediately but live only in memory until
+  the next flush — a crash loses at most `-inmemoryDataFlushInterval`
+  (default 5s) of data. **There is no WAL** (deliberate MVP cut; the flush
+  interval *is* the durability window).
+- `-retentionPeriod=7d` drops whole day partitions whose entire day is
+  older than the retention period, checked at startup and hourly.
+  Day-granular, so up to ~24h of slack — the same trade-off VictoriaMetrics
+  makes with month-sized partitions. Default `0` keeps data forever.
+- The series registry (`series/names.json`) is not pruned by retention in
+  the MVP; it grows with the total number of distinct label sets ever seen.
+
 See [PLAN.md](PLAN.md) for the full MVP plan, VictoriaMetrics source study list, and implementation slices.

@@ -5,10 +5,13 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -25,7 +28,26 @@ var (
 			"A crash can lose at most this much data (durability window)")
 	mergeThreshold = flag.Int("smallPartsMergeThreshold", 3,
 		"A day partition with at least this many small parts merges them into one big part after a flush")
+	retentionPeriod = flag.String("retentionPeriod", "0",
+		"How long to keep data, e.g. 7d. Day partitions whose entire day is older are dropped. 0 keeps data forever")
 )
+
+// parseRetentionDays parses the -retentionPeriod value: "0" (forever) or
+// "<n>d". Day granularity matches the partition layout.
+func parseRetentionDays(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	if !strings.HasSuffix(s, "d") {
+		return 0, fmt.Errorf("want a day count like 7d (or 0), got %q", s)
+	}
+	n, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("want a day count like 7d (or 0), got %q", s)
+	}
+	return n, nil
+}
 
 func main() {
 	flag.Parse()
@@ -36,7 +58,16 @@ func main() {
 	}
 	log.Printf("storage opened at %q (flush interval %s)", store.Path(), *flushInterval)
 	store.SmallPartsMergeThreshold = *mergeThreshold
+	retentionDays, err := parseRetentionDays(*retentionPeriod)
+	if err != nil {
+		log.Fatalf("bad -retentionPeriod: %s", err)
+	}
+	store.RetentionDays = retentionDays
+	if retentionDays > 0 {
+		log.Printf("retention: %dd (checked at startup and hourly)", retentionDays)
+	}
 	store.StartFlushLoop(*flushInterval)
+	store.StartRetentionLoop(time.Hour)
 
 	srv := newServer(store)
 	go func() {

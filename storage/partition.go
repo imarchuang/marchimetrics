@@ -24,9 +24,10 @@ type partition struct {
 	// scan of this partition, so compaction (which needs the write lock
 	// to swap the manifest and delete merged dirs) can never delete a
 	// part out from under an in-flight query.
-	mu     sync.RWMutex
-	parts  []string // live part names; mirrors manifest.json
-	nextID int
+	mu      sync.RWMutex
+	parts   []string // live part names; mirrors manifest.json
+	nextID  int
+	dropped bool // set by retention before the dir is deleted; queries skip
 }
 
 // dayString maps a millisecond timestamp to its UTC day partition name.
@@ -69,6 +70,10 @@ func openPartition(dir, day string) (*partition, error) {
 // orphan dir that the manifest (source of truth) hides from queries.
 func (p *partition) addPart(data map[uint64][]Sample) error {
 	p.mu.Lock()
+	if p.dropped {
+		p.mu.Unlock()
+		return fmt.Errorf("partition %s has been dropped by retention", p.day)
+	}
 	id := p.nextID
 	p.nextID++
 	p.mu.Unlock()
