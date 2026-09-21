@@ -5,7 +5,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -29,21 +28,16 @@ var (
 func main() {
 	flag.Parse()
 
-	s, err := storage.Open(*storageDataPath)
+	store, err := storage.Open(*storageDataPath)
 	if err != nil {
 		log.Fatalf("cannot open storage at %q: %s", *storageDataPath, err)
 	}
-	log.Printf("storage opened at %q (flush interval %s)", s.Path(), *flushInterval)
+	log.Printf("storage opened at %q (flush interval %s)", store.Path(), *flushInterval)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "OK")
-	})
-
+	srv := newServer(store)
 	go func() {
 		log.Printf("listening on %s", *httpListenAddr)
-		if err := http.ListenAndServe(*httpListenAddr, mux); err != nil {
+		if err := http.ListenAndServe(*httpListenAddr, srv.routes()); err != nil {
 			log.Fatalf("http server error: %s", err)
 		}
 	}()
@@ -52,7 +46,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Printf("shutting down")
-	if err := s.Close(); err != nil {
+	if err := store.Close(); err != nil {
 		log.Printf("storage close error: %s", err)
 	}
 }
