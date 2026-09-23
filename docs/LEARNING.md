@@ -158,6 +158,19 @@ MVP scale a permanent forward map is fine (100k series ≈ tens of MB). If
 the registry ever outgrows memory, that is the moment to revisit VM's
 design — with a much clearer understanding of why it exists.
 
+**Implemented (PR-B).** The inverted index lives in
+`series/inverted/YYYYMMDD/` segments (same binary format as the forward
+segments). `Append` adds the series to each covered day's *in-memory*
+inverted index so unflushed data stays findable; `Flush` persists only
+the not-yet-persisted `(day, SeriesID)` pairs (`persisted` set) *before*
+writing the data part — an inverted entry pointing at unwritten data is
+harmless, while data whose index entry is lost would be invisible after a
+restart. `ApplyRetention` deletes the day's inverted directory along with
+the data partition and calls `Registry.DropDay`. A series active on days
+1 and 30 keeps its day-30 findability when day 1 expires; a series seen
+only on day 1 becomes unfindable by label, but `Labels(id)` still
+resolves — the identity never expires.
+
 ## Non-goals (deliberately omitted)
 
 - Cluster split (`vminsert` / `vmselect` / `vmstorage`), HA, replication

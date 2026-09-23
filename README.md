@@ -83,10 +83,12 @@ survives `kill -9`. Design notes: [docs/TSID.md](docs/TSID.md).
   older than the retention period, checked at startup and hourly.
   Day-granular, so up to ~24h of slack — the same trade-off VictoriaMetrics
   makes with month-sized partitions. Default `0` keeps data forever.
-- The series registry lives in `series/indexdb/` as append-only segments —
-  each flush writes only the series registered since the last flush (no
-  more full-file `names.json` rewrite). It is still not pruned by retention
-  in the MVP; it grows with the total number of distinct label sets ever
-  seen. Restart replays the segments to rebuild the in-memory indexes.
+- The series registry is split in two. The **forward map**
+  (`series/indexdb/`, SeriesID → labels) is permanent — a series' identity
+  never expires. The **inverted index** (`series/inverted/YYYYMMDD/`,
+  label → SeriesID) is day-partitioned and dropped by retention together
+  with the day's data: a series is findable by label exactly for the days
+  whose data still exists. Both are append-only segments replayed at
+  startup; see LEARNING.md "Index retention" for the tradeoff.
 
 See [PLAN.md](PLAN.md) for the full MVP plan, VictoriaMetrics source study list, and implementation slices.

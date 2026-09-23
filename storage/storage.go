@@ -6,7 +6,9 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -19,11 +21,13 @@ import (
 // Directory layout under the data path (PLAN.md section 4):
 //
 //	<path>/
-//	  partitions/YYYYMMDD/   day partitions holding immutable parts
-//	  series/indexdb/        append-only registry segments (label set -> SeriesID)
+//	  partitions/YYYYMMDD/          day partitions holding immutable parts
+//	  series/indexdb/               global forward registry segments (permanent)
+//	  series/inverted/YYYYMMDD/     per-day inverted index segments (expire with data)
 const (
 	partitionsDir = "partitions"
 	seriesDir     = "series"
+	invertedDir   = "inverted"
 )
 
 // partitionNameRE matches day partition directory names (YYYYMMDD).
@@ -109,6 +113,16 @@ func (s *Storage) Append(labels []Label, samples []Sample) uint64 {
 		return 0
 	}
 	id := s.registry.Resolve(labels)
+	// Index the series into every day it has samples in, so the mem
+	// buffer is findable by label before any flush (the inverted index
+	// is day-partitioned, so there is no global "in-memory only" index).
+	days := make(map[string]struct{}, 1)
+	for _, sm := range samples {
+		days[dayString(sm.Timestamp)] = struct{}{}
+	}
+	for day := range days {
+		s.registry.IndexForDay(day, id)
+	}
 	s.mu.Lock()
 	s.mem[id] = append(s.mem[id], samples...)
 	s.mu.Unlock()
@@ -176,6 +190,15 @@ func (s *Storage) Flush() error {
 		}
 	}
 	for day, data := range byDay {
+		// Persist the day's inverted index before writing the data part.
+		// This order is crash-safe: an inverted entry pointing at
+		// not-yet-written data is harmless (the query finds the ID,
+		// scans, finds nothing), while data without a persisted index
+		// entry would become invisible after a restart.
+		if err := s.persistDayIndex(day, data); err != nil {
+			s.restoreMem(data)
+			return fmt.Errorf("cannot index partition %s series: %w", day, err)
+		}
 		p, err := s.getPartition(day)
 		if err != nil {
 			s.restoreMem(data)
@@ -244,7 +267,37 @@ func (s *Storage) partitionsInRange(startMs, endMs int64) []*partition {
 	return out
 }
 
-// loadRegistry replays every indexdb segment in order into the registry.
+// persistDayIndex writes inverted-index segments for the series that
+// have data in day but are not yet persisted there. The in-memory
+// inverted index was already updated by Append; this is only about
+// durability across restarts.
+func (s *Storage) persistDayIndex(day string, data map[uint64][]Sample) error {
+	ids := make([]uint64, 0, len(data))
+	for id := range data {
+		ids = append(ids, id)
+	}
+	newIDs := s.registry.UnindexedIDs(day, ids)
+	if len(newIDs) == 0 {
+		return nil
+	}
+	entries := make(map[uint64][]Label, len(newIDs))
+	for _, id := range newIDs {
+		labels, ok := s.registry.Labels(id)
+		if !ok {
+			return fmt.Errorf("series %d missing from registry", id)
+		}
+		entries[id] = labels
+	}
+	dir := filepath.Join(s.path, seriesDir, invertedDir, day)
+	if _, err := appendIndexSegment(dir, entries); err != nil {
+		return err
+	}
+	s.registry.MarkIndexed(day, newIDs)
+	return nil
+}
+
+// loadRegistry replays every forward indexdb segment in order into the
+// registry, then rebuilds the inverted index from the per-day segments.
 func (s *Storage) loadRegistry() error {
 	dir := filepath.Join(s.path, seriesDir, indexdbDir)
 	names, err := listIndexSegments(dir)
@@ -259,6 +312,42 @@ func (s *Storage) loadRegistry() error {
 		})
 		if err != nil {
 			return fmt.Errorf("cannot replay %q: %w", path, err)
+		}
+	}
+	return s.loadInverted()
+}
+
+// loadInverted rebuilds the per-day inverted index from
+// series/inverted/YYYYMMDD/ segments. Days already dropped by retention
+// are simply absent, so expired series stay forgotten across a restart.
+func (s *Storage) loadInverted() error {
+	root := filepath.Join(s.path, seriesDir, invertedDir)
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !partitionNameRE.MatchString(e.Name()) {
+			continue
+		}
+		day := e.Name()
+		dir := filepath.Join(root, day)
+		names, err := listIndexSegments(dir)
+		if err != nil {
+			return fmt.Errorf("cannot list inverted segments for %s: %w", day, err)
+		}
+		for _, name := range names {
+			path := filepath.Join(dir, name)
+			err := readIndexSegment(path, func(id uint64, labels []Label) error {
+				s.registry.LoadInvertedEntry(day, id, labels)
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("cannot replay %q: %w", path, err)
+			}
 		}
 	}
 	return nil

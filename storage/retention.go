@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -80,7 +81,15 @@ func (s *Storage) ApplyRetention(retentionDays int, nowMs int64) error {
 		if err != nil {
 			return fmt.Errorf("cannot drop partition %s: %w", p.day, err)
 		}
-		log.Printf("dropped partition %s (retention %dd, cutoff day %s)", p.day, retentionDays, cutoff)
+		// The day's inverted index expires with its data: series only
+		// ever seen that day become unfindable by label (their identity
+		// in the forward registry is kept — LEARNING.md "Index
+		// retention").
+		if ierr := os.RemoveAll(filepath.Join(s.path, seriesDir, invertedDir, p.day)); ierr != nil {
+			return fmt.Errorf("cannot drop inverted index for %s: %w", p.day, ierr)
+		}
+		s.registry.DropDay(p.day)
+		log.Printf("dropped partition %s and its inverted index (retention %dd, cutoff day %s)", p.day, retentionDays, cutoff)
 	}
 	return nil
 }
