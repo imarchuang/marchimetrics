@@ -113,6 +113,51 @@ the thin stand-in for VM's mergeset IndexDB; rotation and per-day index
 partitions (which would let retention actually forget old series) are
 deliberately left out — see Non-goals.
 
+### Index retention: forget the inverted index, keep the identity
+
+The next question after append-only segments is whether retention should
+make the registry *forget* expired series. Two designs:
+
+**VM's answer — the index expires with the data.** The inverted index
+(label → TSID) is partitioned by generation and dropped wholesale with
+rotation; a series' identity does not depend on the index because the
+data parts reference the TSID directly.
+
+- *Pros:* index memory tracks the active time window, not all of history
+  (this is how VM survives millions of series); data and its index share
+  one lifecycle, so there are no orphan index entries; high-cardinality
+  bursts (e.g. a request-ID label) vanish completely once expired.
+- *Cons:* a big complexity step — when data outlives its index
+  generation, reverse lookup needs the labels redundantly stored in the
+  data part, or you accept "old data is addressable by TSID only, not by
+  label". Query semantics get subtle (does `{job="api"}` still match a
+  series on day 1 whose day-1 index entry is gone but which is still
+  being written on day 30?), and `Labels(id)` can fail entirely once
+  every index generation for a series has expired.
+
+**Our simplification — the forward map never expires.** `ID → labels`
+stays global and permanent; only the inverted index (`label → ID`) is
+partitioned by day and expires with retention.
+
+- *Pros:* simple — the forward map needs no partitioning or eviction;
+  a series' identity and `Labels(id)` never disappear, so data parts
+  store no redundant labels and there are no edge cases; the semantics
+  fit in one sentence ("data expires by day, series registrations are
+  kept forever"); it builds directly on the append-only segments above.
+- *Cons:* memory still grows with the total number of distinct series
+  ever seen (the forward map never shrinks), so the "restart tax" is
+  only half solved — the inverted half can be forgotten, the forward
+  half cannot; a high-cardinality burst permanently enlarges the
+  registry; and it diverges from what VM actually does, so the
+  index-lifecycle lesson is deferred.
+
+**Decision: take the simplification for the MVP.** It buys "retention can
+prune the index" with a small change (day-partition the inverted index)
+while avoiding the "data alive but labels unresolvable" complexity. At
+MVP scale a permanent forward map is fine (100k series ≈ tens of MB). If
+the registry ever outgrows memory, that is the moment to revisit VM's
+design — with a much clearer understanding of why it exists.
+
 ## Non-goals (deliberately omitted)
 
 - Cluster split (`vminsert` / `vmselect` / `vmstorage`), HA, replication
