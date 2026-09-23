@@ -102,6 +102,31 @@ func Open(path string) (*Storage, error) {
 // Path returns the root data path passed to Open.
 func (s *Storage) Path() string { return s.path }
 
+// LoadRegistry replays only the forward series registry (SeriesID ->
+// labels) without opening any data partitions — used by tooling
+// (mmctl) that needs label resolution.
+func LoadRegistry(path string) (*Registry, error) {
+	s := &Storage{path: path, registry: NewRegistry()}
+	if err := s.loadRegistry(); err != nil {
+		return nil, err
+	}
+	return s.registry, nil
+}
+
+// InspectPart reads an entire part for tooling (mmctl): meta plus all
+// series blocks, both raw and gorilla encoded parts supported.
+func InspectPart(dir string) (*PartMeta, map[uint64][]Sample, error) {
+	meta, err := readPartMeta(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	data, err := readPartAll(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	return meta, data, nil
+}
+
 // Registry exposes the series registry (used by HTTP handlers and tests).
 func (s *Storage) Registry() *Registry { return s.registry }
 
