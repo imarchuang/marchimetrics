@@ -78,13 +78,13 @@ func TestRegistryMatchIntersects(t *testing.T) {
 	}
 }
 
-func TestRegistrySnapshotLoadRoundTrip(t *testing.T) {
+func TestRegistryLoadEntriesRoundTrip(t *testing.T) {
 	r := NewRegistry()
 	id1 := r.Resolve([]Label{{Name: MetricNameLabel, Value: "m"}, {Name: "job", Value: "api"}})
 	id2 := r.Resolve([]Label{{Name: MetricNameLabel, Value: "m"}, {Name: "job", Value: "web"}})
 
 	r2 := NewRegistry()
-	r2.Load(r.Snapshot())
+	r2.LoadEntries(map[uint64][]Label{id1: r.names[id1], id2: r.names[id2]})
 
 	// Same label sets resolve to the same IDs after reload.
 	if got := r2.Resolve([]Label{{Name: "job", Value: "api"}, {Name: MetricNameLabel, Value: "m"}}); got != id1 {

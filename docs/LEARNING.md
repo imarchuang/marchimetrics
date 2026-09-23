@@ -96,6 +96,23 @@ deleted file. VM instead refcounts parts and deletes asynchronously (see
 as a bottleneck. Duplicate (series, timestamp) pairs are kept as-is
 (dedup is a non-goal), and big parts are not re-merged in the MVP.
 
+### IndexDB as append-only segments
+
+The series registry used to persist as one `series/names.json` that every
+flush rewrote in full — a growing restart tax and a rewrite of mostly
+unchanged bytes. It is now an LSM of its own: each flush appends only the
+series registered since the last flush as one immutable segment under
+`series/indexdb/NNNNNN.seg` (delta-encoded IDs + varint length-prefixed
+label strings), and Open replays the segments in order to rebuild the
+forward and inverted indexes. Crash safety mirrors part publishing:
+segment write goes through a `.tmp` + rename, and a torn tail record
+(crash between segment rename and the data part it accompanied) is
+tolerated at replay — the registry simply stops at the last complete
+record, which matches the at-most-one-flush durability window. This is
+the thin stand-in for VM's mergeset IndexDB; rotation and per-day index
+partitions (which would let retention actually forget old series) are
+deliberately left out — see Non-goals.
+
 ## Non-goals (deliberately omitted)
 
 - Cluster split (`vminsert` / `vmselect` / `vmstorage`), HA, replication
