@@ -62,6 +62,10 @@ func TestRegistryMatchIntersects(t *testing.T) {
 	api1 := r.Resolve([]Label{{Name: MetricNameLabel, Value: "http_requests_total"}, {Name: "job", Value: "api"}, {Name: "instance", Value: "h1"}})
 	api2 := r.Resolve([]Label{{Name: MetricNameLabel, Value: "http_requests_total"}, {Name: "job", Value: "api"}, {Name: "instance", Value: "h2"}})
 	web := r.Resolve([]Label{{Name: MetricNameLabel, Value: "http_requests_total"}, {Name: "job", Value: "web"}})
+	// Registration alone does not index; Append/Flush index per day.
+	r.IndexForDay("20260924", api1)
+	r.IndexForDay("20260924", api2)
+	r.IndexForDay("20260924", web)
 
 	ids := r.Match([]Matcher{{Name: MetricNameLabel, Value: "http_requests_total"}, {Name: "job", Value: "api"}})
 	if len(ids) != 2 || ids[0] != api1 || ids[1] != api2 {
@@ -90,9 +94,14 @@ func TestRegistryLoadEntriesRoundTrip(t *testing.T) {
 	if got := r2.Resolve([]Label{{Name: "job", Value: "api"}, {Name: MetricNameLabel, Value: "m"}}); got != id1 {
 		t.Fatalf("reloaded registry resolved %d, want %d", got, id1)
 	}
-	// The inverted index is rebuilt from names alone.
+	// The forward map alone does not make series findable: the inverted
+	// index is rebuilt from per-day segments, not from names.
+	if ids := r2.Match([]Matcher{{Name: "job", Value: "web"}}); len(ids) != 0 {
+		t.Fatalf("match without inverted entries = %v, want empty", ids)
+	}
+	r2.LoadInvertedEntry("20260924", id2, r.names[id2])
 	if ids := r2.Match([]Matcher{{Name: "job", Value: "web"}}); len(ids) != 1 || ids[0] != id2 {
-		t.Fatalf("match after reload = %v, want [%d]", ids, id2)
+		t.Fatalf("match after inverted reload = %v, want [%d]", ids, id2)
 	}
 	// New IDs continue past the reloaded maximum.
 	if id3 := r2.Resolve([]Label{{Name: MetricNameLabel, Value: "new"}}); id3 <= id2 {

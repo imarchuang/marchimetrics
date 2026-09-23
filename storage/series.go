@@ -57,28 +57,45 @@ func CanonicalKey(labels []Label) string {
 	return b.String()
 }
 
-// Registry maps label sets to SeriesIDs and back. It is the in-memory
-// counterpart of the indexdb segments under series/indexdb/ (forward)
-// plus the derived inverted index; persistence is append-only — each
-// flush writes only the series registered since the last flush.
+// Registry maps label sets to SeriesIDs and back. Persistence is
+// append-only and split in two (LEARNING.md "Index retention"):
+//
+//   - forward (SeriesID -> labels): global, permanent — series/indexdb/
+//     segments, appended once per newly registered series at flush.
+//   - inverted (label -> SeriesID): day-partitioned — series/inverted/
+//     YYYYMMDD/ segments, written at flush for every series that has
+//     data in that day, and dropped together with the day's data
+//     partition by retention. A series is findable by label exactly for
+//     the days whose data still exists; its identity (Labels(id)) never
+//     expires.
 type Registry struct {
-	mu       sync.RWMutex
-	nextID   uint64
-	byKey    map[string]uint64              // canonical key -> SeriesID
-	names    map[uint64][]Label             // SeriesID -> sorted label set
-	inverted map[string]map[uint64]struct{} // labelKey -> SeriesID set
-	pending  map[uint64][]Label             // registered since last DrainPending
+	mu      sync.RWMutex
+	nextID  uint64
+	byKey   map[string]uint64  // canonical key -> SeriesID
+	names   map[uint64][]Label // SeriesID -> sorted label set
+	pending map[uint64][]Label // registered since last DrainPending
+
+	// invertedByDay is the queryable inverted index: day -> labelKey ->
+	// SeriesID set. Match unions the per-day sets. persisted tracks which
+	// (day, SeriesID) pairs are durably on disk, so a long-lived series
+	// is re-indexed into each new day but not rewritten into a day it is
+	// already persisted in. (In-memory membership in invertedByDay is
+	// separate: Append adds entries there immediately so unflushed data
+	// is findable.)
+	invertedByDay map[string]map[string]map[uint64]struct{}
+	persisted     map[string]map[uint64]struct{}
 }
 
 // NewRegistry returns an empty registry. IDs start at 1 so that 0 can
 // mean "no series" in later code.
 func NewRegistry() *Registry {
 	return &Registry{
-		nextID:   1,
-		byKey:    make(map[string]uint64),
-		names:    make(map[uint64][]Label),
-		inverted: make(map[string]map[uint64]struct{}),
-		pending:  make(map[uint64][]Label),
+		nextID:        1,
+		byKey:         make(map[string]uint64),
+		names:         make(map[uint64][]Label),
+		pending:       make(map[uint64][]Label),
+		invertedByDay: make(map[string]map[string]map[uint64]struct{}),
+		persisted:     make(map[string]map[uint64]struct{}),
 	}
 }
 
@@ -107,15 +124,6 @@ func (r *Registry) Resolve(labels []Label) uint64 {
 	sorted := sortedLabels(labels)
 	r.names[id] = sorted
 	r.pending[id] = sorted
-	for _, l := range sorted {
-		k := labelKey(l.Name, l.Value)
-		set := r.inverted[k]
-		if set == nil {
-			set = make(map[uint64]struct{})
-			r.inverted[k] = set
-		}
-		set[id] = struct{}{}
-	}
 	return id
 }
 
@@ -164,12 +172,13 @@ func (r *Registry) TrackPending(entries map[uint64][]Label) {
 	}
 }
 
-// LoadEntries replays indexdb records (SeriesID -> label set), rebuilding
-// the canonical and inverted indexes and continuing IDs past the maximum
+// LoadEntries replays forward indexdb records (SeriesID -> label set),
+// rebuilding the canonical index and continuing IDs past the maximum
 // seen. It is idempotent: replaying the same record twice converges to
 // the same state, which is what makes a torn final segment harmless.
-// The inverted index is deliberately not persisted: the segments are the
-// single source of truth and the index is derived from them at load time.
+// The inverted index is NOT derived here — it is rebuilt separately from
+// the per-day inverted segments (LoadInvertedEntry), so that expired
+// days stay forgotten across a restart.
 func (r *Registry) LoadEntries(entries map[uint64][]Label) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -182,15 +191,6 @@ func (r *Registry) LoadEntries(entries map[uint64][]Label) {
 		}
 		r.names[id] = sorted
 		r.byKey[key] = id
-		for _, l := range sorted {
-			k := labelKey(l.Name, l.Value)
-			set := r.inverted[k]
-			if set == nil {
-				set = make(map[uint64]struct{})
-				r.inverted[k] = set
-			}
-			set[id] = struct{}{}
-		}
 		if id > maxID {
 			maxID = id
 		}
@@ -200,15 +200,106 @@ func (r *Registry) LoadEntries(entries map[uint64][]Label) {
 	}
 }
 
+// IndexForDay adds id to day's in-memory inverted index (using the
+// registered labels) without marking it persisted. Append uses this to
+// keep the mem buffer findable; Flush later persists the delta via
+// UnindexedIDs + MarkIndexed.
+func (r *Registry) IndexForDay(day string, id uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.addInvertedLocked(day, id, r.names[id])
+}
+
+// UnindexedIDs returns the subset of ids not yet persisted in day's
+// inverted index. Flush writes exactly these as an inverted segment.
+func (r *Registry) UnindexedIDs(day string, ids []uint64) []uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	done := r.persisted[day]
+	var out []uint64
+	for _, id := range ids {
+		if _, ok := done[id]; !ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// MarkIndexed records that ids are now persisted in day's inverted
+// index. Called only after the segment write succeeded. (Append already
+// made them visible in memory.)
+func (r *Registry) MarkIndexed(day string, ids []uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range ids {
+		r.markPersistedLocked(day, id)
+	}
+}
+
+// LoadInvertedEntry replays one inverted segment record at open: the
+// entry is both visible in memory and known to be on disk.
+func (r *Registry) LoadInvertedEntry(day string, id uint64, labels []Label) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.addInvertedLocked(day, id, labels)
+	r.markPersistedLocked(day, id)
+}
+
+// addInvertedLocked updates the in-memory inverted index only.
+func (r *Registry) addInvertedLocked(day string, id uint64, labels []Label) {
+	inv := r.invertedByDay[day]
+	if inv == nil {
+		inv = make(map[string]map[uint64]struct{})
+		r.invertedByDay[day] = inv
+	}
+	for _, l := range labels {
+		k := labelKey(l.Name, l.Value)
+		set := inv[k]
+		if set == nil {
+			set = make(map[uint64]struct{})
+			inv[k] = set
+		}
+		set[id] = struct{}{}
+	}
+}
+
+// markPersistedLocked records (day, id) as durably on disk.
+func (r *Registry) markPersistedLocked(day string, id uint64) {
+	done := r.persisted[day]
+	if done == nil {
+		done = make(map[uint64]struct{})
+		r.persisted[day] = done
+	}
+	done[id] = struct{}{}
+}
+
+// DropDay forgets day's inverted index — retention drops it together
+// with the day's data partition. Series identities (names/byKey) are
+// unaffected.
+func (r *Registry) DropDay(day string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.invertedByDay, day)
+	delete(r.persisted, day)
+}
+
 // Match returns the sorted SeriesIDs whose label sets satisfy every
-// equality matcher, intersecting inverted-index sets.
+// equality matcher. Each matcher's candidate set is the union of the
+// per-day inverted sets (a series indexed in any live day is a
+// candidate); the per-matcher sets are then intersected as before.
 func (r *Registry) Match(matchers []Matcher) []uint64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	var ids []uint64
 	for i, m := range matchers {
-		set := r.inverted[labelKey(m.Name, m.Value)]
+		key := labelKey(m.Name, m.Value)
+		set := make(map[uint64]struct{})
+		for _, inv := range r.invertedByDay {
+			for id := range inv[key] {
+				set[id] = struct{}{}
+			}
+		}
 		if len(set) == 0 {
 			return nil
 		}
