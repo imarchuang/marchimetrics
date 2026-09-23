@@ -6,10 +6,7 @@
 package storage
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -23,11 +20,10 @@ import (
 //
 //	<path>/
 //	  partitions/YYYYMMDD/   day partitions holding immutable parts
-//	  series/                global series registry (label set -> SeriesID)
+//	  series/indexdb/        append-only registry segments (label set -> SeriesID)
 const (
 	partitionsDir = "partitions"
 	seriesDir     = "series"
-	namesFile     = "names.json"
 )
 
 // partitionNameRE matches day partition directory names (YYYYMMDD).
@@ -140,9 +136,10 @@ func (s *Storage) StartFlushLoop(interval time.Duration) {
 }
 
 // Flush atomically swaps the in-memory buffer for a fresh one, persists
-// the series registry, and writes the swapped samples as immutable parts
-// grouped into day partitions by sample timestamp. On error, unflushed
-// samples are returned to the buffer so the next flush retries them.
+// the newly registered series as one indexdb segment, and writes the
+// swapped samples as immutable parts grouped into day partitions by
+// sample timestamp. On error, unflushed samples and pending registry
+// entries are returned so the next flush retries them.
 func (s *Storage) Flush() error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
@@ -152,7 +149,13 @@ func (s *Storage) Flush() error {
 	s.mem = make(map[uint64][]Sample)
 	s.mu.Unlock()
 
-	if err := s.saveRegistry(); err != nil {
+	// Persist only the series registered since the last flush — the
+	// append-only replacement for rewriting names.json. Done before the
+	// data parts so a crash never leaves a part pointing at a SeriesID
+	// the registry has never heard of.
+	pending := s.registry.DrainPending()
+	if err := s.saveRegistrySegment(pending); err != nil {
+		s.registry.TrackPending(pending)
 		s.restoreMem(mem)
 		return fmt.Errorf("cannot save series registry: %w", err)
 	}
@@ -241,34 +244,32 @@ func (s *Storage) partitionsInRange(startMs, endMs int64) []*partition {
 	return out
 }
 
+// loadRegistry replays every indexdb segment in order into the registry.
 func (s *Storage) loadRegistry() error {
-	path := filepath.Join(s.path, seriesDir, namesFile)
-	data, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
+	dir := filepath.Join(s.path, seriesDir, indexdbDir)
+	names, err := listIndexSegments(dir)
 	if err != nil {
-		return fmt.Errorf("cannot read %q: %w", path, err)
+		return fmt.Errorf("cannot list indexdb segments: %w", err)
 	}
-	var names map[uint64][]Label
-	if err := json.Unmarshal(data, &names); err != nil {
-		return fmt.Errorf("cannot parse %q: %w", path, err)
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		err := readIndexSegment(path, func(id uint64, labels []Label) error {
+			s.registry.LoadEntries(map[uint64][]Label{id: labels})
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("cannot replay %q: %w", path, err)
+		}
 	}
-	s.registry.Load(names)
 	return nil
 }
 
-func (s *Storage) saveRegistry() error {
-	data, err := json.Marshal(s.registry.Snapshot())
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(s.path, seriesDir, namesFile)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+// saveRegistrySegment appends pending registry entries as one new
+// indexdb segment. A no-op when nothing was registered since last flush.
+func (s *Storage) saveRegistrySegment(pending map[uint64][]Label) error {
+	dir := filepath.Join(s.path, seriesDir, indexdbDir)
+	_, err := appendIndexSegment(dir, pending)
+	return err
 }
 
 func (s *Storage) loadPartitions() error {

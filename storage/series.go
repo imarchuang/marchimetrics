@@ -58,14 +58,16 @@ func CanonicalKey(labels []Label) string {
 }
 
 // Registry maps label sets to SeriesIDs and back. It is the in-memory
-// counterpart of series/names.json (forward) and series/inverted.json
-// (inverted); persistence arrives with flushing in PR2.
+// counterpart of the indexdb segments under series/indexdb/ (forward)
+// plus the derived inverted index; persistence is append-only — each
+// flush writes only the series registered since the last flush.
 type Registry struct {
 	mu       sync.RWMutex
 	nextID   uint64
 	byKey    map[string]uint64              // canonical key -> SeriesID
 	names    map[uint64][]Label             // SeriesID -> sorted label set
 	inverted map[string]map[uint64]struct{} // labelKey -> SeriesID set
+	pending  map[uint64][]Label             // registered since last DrainPending
 }
 
 // NewRegistry returns an empty registry. IDs start at 1 so that 0 can
@@ -76,6 +78,7 @@ func NewRegistry() *Registry {
 		byKey:    make(map[string]uint64),
 		names:    make(map[uint64][]Label),
 		inverted: make(map[string]map[uint64]struct{}),
+		pending:  make(map[uint64][]Label),
 	}
 }
 
@@ -103,6 +106,7 @@ func (r *Registry) Resolve(labels []Label) uint64 {
 	r.byKey[key] = id
 	sorted := sortedLabels(labels)
 	r.names[id] = sorted
+	r.pending[id] = sorted
 	for _, l := range sorted {
 		k := labelKey(l.Name, l.Value)
 		set := r.inverted[k]
@@ -130,30 +134,54 @@ func (r *Registry) Len() int {
 	return len(r.names)
 }
 
-// Snapshot returns a copy of the forward mapping (SeriesID -> sorted
-// label set) for persistence as series/names.json.
-func (r *Registry) Snapshot() map[uint64][]Label {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make(map[uint64][]Label, len(r.names))
-	for id, labels := range r.names {
-		out[id] = labels
+// DrainPending returns the series registered since the last DrainPending
+// call and clears the pending set. Flush persists exactly this delta as
+// one indexdb segment — the append-only replacement for rewriting all of
+// names.json every flush.
+func (r *Registry) DrainPending() map[uint64][]Label {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.pending) == 0 {
+		return nil
 	}
+	out := r.pending
+	r.pending = make(map[uint64][]Label)
 	return out
 }
 
-// Load restores a snapshot taken by Snapshot, rebuilding the canonical
-// and inverted indexes and continuing IDs past the maximum seen. The
-// inverted index is deliberately not persisted: names.json is the single
-// source of truth and the index is derived from it at load time.
-func (r *Registry) Load(names map[uint64][]Label) {
+// TrackPending returns entries to the pending set after a failed flush,
+// so the next flush retries them. Entries already known to the registry
+// are kept pending (idempotent — re-appending the same ID to the indexdb
+// is harmless because replay is idempotent).
+func (r *Registry) TrackPending(entries map[uint64][]Label) {
+	if len(entries) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, labels := range entries {
+		r.pending[id] = labels
+	}
+}
+
+// LoadEntries replays indexdb records (SeriesID -> label set), rebuilding
+// the canonical and inverted indexes and continuing IDs past the maximum
+// seen. It is idempotent: replaying the same record twice converges to
+// the same state, which is what makes a torn final segment harmless.
+// The inverted index is deliberately not persisted: the segments are the
+// single source of truth and the index is derived from them at load time.
+func (r *Registry) LoadEntries(entries map[uint64][]Label) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var maxID uint64
-	for id, labels := range names {
+	for id, labels := range entries {
 		sorted := sortedLabels(labels)
+		key := CanonicalKey(sorted)
+		if existing, ok := r.byKey[key]; ok && existing == id {
+			continue // replay of an already-known series
+		}
 		r.names[id] = sorted
-		r.byKey[CanonicalKey(sorted)] = id
+		r.byKey[key] = id
 		for _, l := range sorted {
 			k := labelKey(l.Name, l.Value)
 			set := r.inverted[k]
