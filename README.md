@@ -62,6 +62,17 @@ curl -XPOST localhost:8428/internal/force_flush
 # inspect: /tmp/mm-data/partitions/YYYYMMDD/{manifest.json,parts/000001/...}
 ```
 
+Parts store samples compressed — delta-of-delta + varint timestamps,
+Gorilla-XOR values (`encoding: "gorilla"` in each part's `meta.json`;
+older raw parts stay readable). To look inside a part, use `mmctl`
+(included in the Docker image):
+
+```bash
+mmctl inspect /tmp/mm-data/partitions/20260924/parts/000001            # per-series summary
+mmctl inspect /tmp/mm-data/partitions/20260924/parts/000001 -samples   # every point
+# inside the demo container: docker exec -it marchimetrics mmctl inspect /data/partitions/...
+```
+
 Compaction: once a day partition accumulates `-smallPartsMergeThreshold`
 (default 3) small parts, they merge into one `tier: big` part
 automatically after a flush — or on demand:

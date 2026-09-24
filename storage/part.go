@@ -27,30 +27,48 @@ const (
 	tierBig   = "big"
 )
 
-// partMeta is meta.json inside each part directory.
-type partMeta struct {
+// Block encodings recorded in meta.json. Parts written before
+// compression was added have no encoding field and are read as raw.
+const (
+	encodingRaw     = "raw"     // fixed 8-byte cells (pre-compression parts)
+	encodingGorilla = "gorilla" // dod+varint timestamps, XOR values
+)
+
+// PartMeta is meta.json inside each part directory.
+type PartMeta struct {
 	MinTime      int64  `json:"minTime"` // milliseconds
 	MaxTime      int64  `json:"maxTime"`
 	SeriesCount  int    `json:"seriesCount"`
 	SamplesCount int    `json:"samplesCount"`
 	Tier         string `json:"tier"`
+	Encoding     string `json:"encoding,omitempty"` // empty = raw (legacy parts)
 }
 
 // seriesIndexEntry maps a series to its block inside the shared bin
-// files. Both files store fixed-size 8-byte cells, so a block occupies
-// bytes [offset*8, (offset+count)*8) in timestamps.bin and values.bin
-// alike.
+// files. Raw parts use Offset+Count (fixed 8-byte cells, one pair
+// addressing both files). Gorilla parts use byte ranges per file.
 type seriesIndexEntry struct {
-	Offset uint64 `json:"offset"` // in samples
+	Offset uint64 `json:"offset,omitempty"` // raw: in samples
 	Count  uint64 `json:"count"`
+
+	TSOffset  uint64 `json:"tsOffset,omitempty"`  // gorilla: byte offset in timestamps.bin
+	TSLength  uint64 `json:"tsLength,omitempty"`  // gorilla: block length in bytes
+	ValOffset uint64 `json:"valOffset,omitempty"` // gorilla: byte offset in values.bin
+	ValLength uint64 `json:"valLength,omitempty"` // gorilla: block length in bytes
 }
 
 // writePart writes data as the contents of dir (already named
-// .publishing-* by the caller, who renames it into place afterwards).
-// tier is tierSmall for flushes, tierBig for compaction output.
-// Samples are stored raw little-endian — VM does delta/varint encoding
-// and compression here, which the MVP deliberately skips (LEARNING.md).
-func writePart(dir string, data map[uint64][]Sample, tier string) (*partMeta, error) {
+// .publishing-* by the caller, who renames it into place afterwards),
+// gorilla-encoded. tier is tierSmall for flushes, tierBig for
+// compaction output.
+func writePart(dir string, data map[uint64][]Sample, tier string) (*PartMeta, error) {
+	return writePartEncoded(dir, data, tier, encodingGorilla)
+}
+
+// writePartEncoded is writePart with an explicit encoding — tests use
+// it to produce legacy raw parts and verify the read path stays
+// backward compatible.
+func writePartEncoded(dir string, data map[uint64][]Sample, tier, encoding string) (*PartMeta, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -63,17 +81,36 @@ func writePart(dir string, data map[uint64][]Sample, tier string) (*partMeta, er
 
 	var tsBuf, valBuf bytes.Buffer
 	index := make(map[string]seriesIndexEntry, len(ids))
-	meta := &partMeta{MinTime: math.MaxInt64, MaxTime: math.MinInt64, Tier: tier}
+	meta := &PartMeta{MinTime: math.MaxInt64, MaxTime: math.MinInt64, Tier: tier, Encoding: encoding}
 	var b [8]byte
 	var offset uint64
 	for _, id := range ids {
 		samples := data[id]
 		sort.Slice(samples, func(i, j int) bool { return samples[i].Timestamp < samples[j].Timestamp })
+
+		entry := seriesIndexEntry{Count: uint64(len(samples))}
+		switch encoding {
+		case encodingGorilla:
+			tsBlock := encodeTimestamps(sampleTimestamps(samples))
+			valBlock := encodeValues(sampleValues(samples))
+			entry.TSOffset = uint64(tsBuf.Len())
+			entry.TSLength = uint64(len(tsBlock))
+			entry.ValOffset = uint64(valBuf.Len())
+			entry.ValLength = uint64(len(valBlock))
+			tsBuf.Write(tsBlock)
+			valBuf.Write(valBlock)
+		default: // raw
+			entry.Offset = offset
+			for _, sm := range samples {
+				binary.LittleEndian.PutUint64(b[:], uint64(sm.Timestamp))
+				tsBuf.Write(b[:])
+				binary.LittleEndian.PutUint64(b[:], math.Float64bits(sm.Value))
+				valBuf.Write(b[:])
+			}
+			offset += uint64(len(samples))
+		}
+
 		for _, sm := range samples {
-			binary.LittleEndian.PutUint64(b[:], uint64(sm.Timestamp))
-			tsBuf.Write(b[:])
-			binary.LittleEndian.PutUint64(b[:], math.Float64bits(sm.Value))
-			valBuf.Write(b[:])
 			if sm.Timestamp < meta.MinTime {
 				meta.MinTime = sm.Timestamp
 			}
@@ -81,8 +118,7 @@ func writePart(dir string, data map[uint64][]Sample, tier string) (*partMeta, er
 				meta.MaxTime = sm.Timestamp
 			}
 		}
-		index[strconv.FormatUint(id, 10)] = seriesIndexEntry{Offset: offset, Count: uint64(len(samples))}
-		offset += uint64(len(samples))
+		index[strconv.FormatUint(id, 10)] = entry
 		meta.SamplesCount += len(samples)
 	}
 	meta.SeriesCount = len(ids)
@@ -110,12 +146,12 @@ func writePart(dir string, data map[uint64][]Sample, tier string) (*partMeta, er
 
 // readPartMeta reads just meta.json — used for time-range pruning and
 // by compaction to find small parts.
-func readPartMeta(dir string) (*partMeta, error) {
+func readPartMeta(dir string) (*PartMeta, error) {
 	data, err := os.ReadFile(filepath.Join(dir, partMetaFile))
 	if err != nil {
 		return nil, fmt.Errorf("cannot read %s: %w", partMetaFile, err)
 	}
-	var meta partMeta
+	var meta PartMeta
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("cannot parse %s: %w", partMetaFile, err)
 	}
@@ -167,24 +203,66 @@ func readPart(dir string, want map[uint64]struct{}, startMs, endMs int64, st *Qu
 		}
 		st.BlocksScanned++
 		st.PointsScanned += int(e.Count)
-		tsBuf := make([]byte, e.Count*8)
-		if _, err := tsFile.ReadAt(tsBuf, int64(e.Offset*8)); err != nil {
-			return nil, fmt.Errorf("cannot read timestamps for series %d: %w", id, err)
+		samples, err := readSeriesBlock(tsFile, valFile, e, meta.Encoding)
+		if err != nil {
+			return nil, fmt.Errorf("cannot decode series %d: %w", id, err)
 		}
-		valBuf := make([]byte, e.Count*8)
-		if _, err := valFile.ReadAt(valBuf, int64(e.Offset*8)); err != nil {
-			return nil, fmt.Errorf("cannot read values for series %d: %w", id, err)
-		}
-		for i := uint64(0); i < e.Count; i++ {
-			t := int64(binary.LittleEndian.Uint64(tsBuf[i*8:]))
-			if t < startMs || t > endMs {
+		for _, sm := range samples {
+			if sm.Timestamp < startMs || sm.Timestamp > endMs {
 				continue
 			}
-			v := math.Float64frombits(binary.LittleEndian.Uint64(valBuf[i*8:]))
-			out[id] = append(out[id], Sample{Timestamp: t, Value: v})
+			out[id] = append(out[id], sm)
 		}
 	}
 	return out, nil
+}
+
+// readSeriesBlock decodes one series' timestamps+values block pair,
+// dispatching on the part's encoding.
+func readSeriesBlock(tsFile, valFile *os.File, e seriesIndexEntry, encoding string) ([]Sample, error) {
+	if encoding == encodingGorilla {
+		tsBuf := make([]byte, e.TSLength)
+		if _, err := tsFile.ReadAt(tsBuf, int64(e.TSOffset)); err != nil {
+			return nil, err
+		}
+		valBuf := make([]byte, e.ValLength)
+		if _, err := valFile.ReadAt(valBuf, int64(e.ValOffset)); err != nil {
+			return nil, err
+		}
+		ts, err := decodeTimestamps(tsBuf)
+		if err != nil {
+			return nil, err
+		}
+		vs, err := decodeValues(valBuf)
+		if err != nil {
+			return nil, err
+		}
+		if uint64(len(ts)) != e.Count || uint64(len(vs)) != e.Count {
+			return nil, fmt.Errorf("decoded %d timestamps / %d values, want %d", len(ts), len(vs), e.Count)
+		}
+		samples := make([]Sample, len(ts))
+		for i := range ts {
+			samples[i] = Sample{Timestamp: ts[i], Value: vs[i]}
+		}
+		return samples, nil
+	}
+
+	// Raw: fixed 8-byte cells addressed by one {offset, count} pair.
+	tsBuf := make([]byte, e.Count*8)
+	if _, err := tsFile.ReadAt(tsBuf, int64(e.Offset*8)); err != nil {
+		return nil, err
+	}
+	valBuf := make([]byte, e.Count*8)
+	if _, err := valFile.ReadAt(valBuf, int64(e.Offset*8)); err != nil {
+		return nil, err
+	}
+	samples := make([]Sample, 0, e.Count)
+	for i := uint64(0); i < e.Count; i++ {
+		t := int64(binary.LittleEndian.Uint64(tsBuf[i*8:]))
+		v := math.Float64frombits(binary.LittleEndian.Uint64(valBuf[i*8:]))
+		samples = append(samples, Sample{Timestamp: t, Value: v})
+	}
+	return samples, nil
 }
 
 // readPartAll reads every series block in the part without any time
@@ -210,29 +288,41 @@ func readPartAll(dir string) (map[uint64][]Sample, error) {
 	}
 	defer valFile.Close()
 
+	meta, err := readPartMeta(dir)
+	if err != nil {
+		return nil, err
+	}
+
 	out := make(map[uint64][]Sample, len(index))
 	for idStr, e := range index {
 		id, err := strconv.ParseUint(idStr, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("bad series id %q in %s: %w", idStr, partSeriesIndex, err)
 		}
-		tsBuf := make([]byte, e.Count*8)
-		if _, err := tsFile.ReadAt(tsBuf, int64(e.Offset*8)); err != nil {
-			return nil, fmt.Errorf("cannot read timestamps for series %d: %w", id, err)
-		}
-		valBuf := make([]byte, e.Count*8)
-		if _, err := valFile.ReadAt(valBuf, int64(e.Offset*8)); err != nil {
-			return nil, fmt.Errorf("cannot read values for series %d: %w", id, err)
-		}
-		samples := make([]Sample, 0, e.Count)
-		for i := uint64(0); i < e.Count; i++ {
-			t := int64(binary.LittleEndian.Uint64(tsBuf[i*8:]))
-			v := math.Float64frombits(binary.LittleEndian.Uint64(valBuf[i*8:]))
-			samples = append(samples, Sample{Timestamp: t, Value: v})
+		samples, err := readSeriesBlock(tsFile, valFile, e, meta.Encoding)
+		if err != nil {
+			return nil, fmt.Errorf("cannot decode series %d: %w", id, err)
 		}
 		out[id] = samples
 	}
 	return out, nil
+}
+
+// sampleTimestamps / sampleValues split a sample slice for the encoders.
+func sampleTimestamps(samples []Sample) []int64 {
+	out := make([]int64, len(samples))
+	for i, sm := range samples {
+		out[i] = sm.Timestamp
+	}
+	return out
+}
+
+func sampleValues(samples []Sample) []float64 {
+	out := make([]float64, len(samples))
+	for i, sm := range samples {
+		out[i] = sm.Value
+	}
+	return out
 }
 
 // writeJSON writes v as indented JSON via a temp file + rename, so a

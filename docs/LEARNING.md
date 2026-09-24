@@ -113,6 +113,32 @@ the thin stand-in for VM's mergeset IndexDB; rotation and per-day index
 partitions (which would let retention actually forget old series) are
 deliberately left out — see Non-goals.
 
+### Block encoding: delta-of-delta timestamps, Gorilla XOR values
+
+Part bin files started as raw little-endian 8-byte cells — 16 bytes per
+sample, and readable with `od`. They are now compressed like every real
+TSDB does:
+
+- **Timestamps** (`timestamps.bin`): delta-of-delta + zigzag varint,
+  byte-aligned. The first timestamp is stored raw, then the first delta,
+  then each delta's difference from the previous delta. A regular 15s
+  scrape interval encodes to ~1 byte per point (every dod is 0) — about
+  8x smaller than raw.
+- **Values** (`values.bin`): the Gorilla XOR bitstream. Each value is
+  XORed with its predecessor: identical values cost 1 bit (constant
+  gauges ≈ 0.14 B/pt); otherwise the XOR's significant bits are written,
+  reusing the previous leading/trailing-zero window when it fits. Random
+  floats compress poorly (~1.3x) — real metrics are rarely random.
+
+The trade-off: `cat`/`od` no longer show anything meaningful, so the repo
+ships `mmctl inspect <part-dir>` (`cmd/mmctl`) — the human-readable
+window into parts, resolving SeriesIDs to label sets via the registry.
+VM's parts are likewise binary-only and come with separate tooling.
+
+Backward compatibility: `meta.json` records `encoding: "gorilla"`; parts
+written before this change have no encoding field and are still read as
+raw, so old data dirs keep working.
+
 ### Index retention: forget the inverted index, keep the identity
 
 The next question after append-only segments is whether retention should
